@@ -1,0 +1,206 @@
+---
+title: "Pacvec_tick_infection"
+output: html_document
+date: "2026-07-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+#Create github repository for this project
+
+usethis::use_github()
+
+#load data as of 06-10-2026
+#2026 tick data counts are current but no infection data yet
+#2024 to 2025 data with infection data but some samples need confirmation still
+tick<-read.csv("data/raw_data/pacvec_tick_23_to_26.csv", header=T)
+
+#change tick infection to factor 
+tick$Infection <- as.factor(tick$Infection)
+tick$year_f<-as.factor(tick$year)
+head(tick)
+str(tick)
+colnames(tick)
+
+sub_tick<-tick[!is.na(tick$Infection),]
+
+#subsample data to just be IPAC nymphs from 2023-2025
+
+tick_sub<- sub_tick %>%
+  filter(species == "IPAC", stage == "N")
+
+tick_sub23<- sub_tick %>%
+  filter(species == "IPAC", year == "2023")
+  
+tick_sub24<- sub_tick %>%
+  filter(species == "IPAC", year == "2024")
+  
+tick_sub25<- sub_tick %>%
+  filter(species == "IPAC", year == "2025")
+  
+sub_tick<- bind_rows(tick_sub23, tick_sub24, tick_sub25)
+str(sub_tick)
+
+#load tidymodels package which includes parsnip and yardstick packages
+install.packages("tidymodels")
+library(tidymodels)
+
+install.packages("xgboost")
+library(xgboost)
+
+#Create training and test set
+
+##############################
+## create train/test split ##
+##############################
+
+#install training package
+install.packages("rsample")
+library(rsample)
+
+#set seed for reproducibility 
+set.seed(123)
+
+#create split with 80% for training
+tick_split<-initial_split(sub_tick, prop=0.8)
+
+#extract training and test sets
+
+tick_train <-training(tick_split)
+tick_test <- testing(tick_split)
+
+dim(tick_test) 
+dim(tick_train) #confirm split as requested
+
+######Specify and Train models #####
+##Building a basic decision tree ###
+# Build the specification 
+#notes 7/10/26 basic decision tree model assessment is not working. 
+model_spec <- decision_tree() %>%
+  set_mode("classification") %>%
+  set_engine("rpart")
+
+# Fit to the data
+model_fit <- model_spec %>%
+  fit(formula = Infection~ treatment_specific+year+site+drag_num,
+      data = tick_train)
+
+model_fit
+
+#Predict new values with the test dataset 
+# Train the model
+tick_model <- model_spec %>%
+  fit(formula = Infection~ treatment_specific+year+site+drag_num,
+      data = tick_train)
+
+# Predict new data
+predictions <- predict(tick_model,
+                       new_data = tick_test) %>%
+  # Add the test set
+  bind_cols(tick_test) #adding test set to the predictions tibble
+
+predictions
+
+#Assessing model performance with MAE or RMSE
+# Predict using the training set
+in_sample_predictions <- predict(tick_model,
+                                 new_data=tick_train)
+
+# Calculate the vector of absolute differences
+abs_diffs <- (abs(in_sample_predictions$.pred_class - tick_train$Infection))
+
+# Calculate the mean absolute error
+1 / length(abs_diffs) * sum(abs_diffs)
+
+#Predict ratings on test set and add true grades
+test_enriched <- predict(tick_model, new_data = tick_test) %>%
+    bind_cols(tick_test)
+    
+# Compute the mean absolute error using one single function
+##not working
+mae(test_enriched,
+    estimate=.pred_class,
+    truth = Infection)
+
+#Root mean square error penalizes larger predictions
+# Calculate the squared differences
+# Calculate the squared differences
+squared_diffs <- (test_enriched$.pred - test_enriched$final_grade)^ 2
+
+# Compute the RMSE using the formula
+rmse_manual <- sqrt(1 / length(squared_diffs) * sum(squared_diffs))
+
+# Compute the RMSE using a function
+rmse_auto <- rmse(test_enriched,
+                 estimate=.pred_class,
+                 truth = Infection)
+
+# Print both errors
+rmse_manual
+rmse_auto
+#####################################
+#Specify a boosted regression tree
+boost_spec<-boost_tree() %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+#Train model on training set and analyze tick infection dataset to predict "infection" yes/no against treatment site year etc. 
+boost_model<-fit(boost_spec, formula = Infection~treatment_specific+year+site+drag_num, data=tick_train)
+
+boost_model
+
+#evaluate the ensemble with resampling and folds using auc as the metrics
+set.seed(99)
+
+# Create CV folds
+folds <- vfold_cv(tick_train, v=5)
+
+# Fit and evaluate models for all folds
+cv_results <- fit_resamples(boost_spec,
+                            Infection~ treatment_specific+year+site+drag_num,
+                            resamples = folds,
+                            metrics=metric_set(roc_auc))
+
+# Collect cross-validated metrics
+collect_metrics(cv_results)
+
+#full model and compare to single classifier
+set.seed(100)
+
+# Specify, fit, predict, and combine with training data
+predictions <- boost_tree() %>%
+  set_mode("classification") %>%
+  set_engine("xgboost") %>% 
+  fit(Infection ~ treatment_specific + year + site + drag_num, data = tick_train) %>%
+  predict(new_data = tick_train, type = "prob") %>% 
+  bind_cols(tick_train)
+
+# Calculate AUC
+#having issues here. go backa nd remove unecesary columns like identifyer name, date, etc,
+roc_auc(predictions, 
+        truth = Infection)
+
+roc_auc_vec(predictions, truth = Infection, estimate = .pred_Yes)
+
